@@ -661,3 +661,155 @@ Renders the composable in Android Studio without running the app. This is why th
 | What is a `Modifier`? | Chains UI instructions (size, padding, clicks); order matters |
 
 ---
+
+## Q9: MainActivity — the app entry point
+
+### Single Activity Pattern
+The entire app has **one Activity** — `MainActivity`. All screens are Compose composables swapped in and out by the NavController. No other Activities exist.
+
+### `@AndroidEntryPoint`
+```kotlin
+@AndroidEntryPoint
+class MainActivity : ComponentActivity()
+```
+Required by Hilt on any Activity using injection. Without it, `hiltViewModel()` calls crash.
+
+### Auth check on launch
+```kotlin
+val startDestination = remember {
+    if (authViewModel.authState.value == AuthCheckState.LoggedIn)
+        Screen.Home.route
+    else
+        Screen.Login.route
+}
+```
+`AuthViewModel` checks `FirebaseAuth.currentUser` — **synchronous**, no network call, Firebase caches it locally. `remember` ensures `startDestination` is computed once and never recalculated on recomposition.
+
+### Reacting to logout
+```kotlin
+val initialAuthState = remember { authViewModel.authState.value }
+LaunchedEffect(authState) {
+    if (authState == initialAuthState) return@LaunchedEffect
+    if (authState == AuthCheckState.LoggedOut) {
+        navController.navigate(Screen.Login.route) {
+            popUpTo(0) { inclusive = true }
+        }
+    }
+}
+```
+`popUpTo(0) { inclusive = true }` clears the **entire** back stack. After logout the user can't press Back to re-enter the app. The `initialAuthState` guard prevents navigating on the very first composition.
+
+### Bottom Navigation Bar
+```kotlin
+val showBottomBar = currentRoute in bottomNavScreens.map { it.first.route }
+```
+Only shown on the 4 main screens — not on Login, Register, or JobDetails.
+
+```kotlin
+navController.navigate(screen.route) {
+    popUpTo(Screen.Home.route) { saveState = true }
+    launchSingleTop = true
+    restoreState = true
+}
+```
+- `launchSingleTop` — don't create a second copy of a screen already on top
+- `saveState` / `restoreState` — remember scroll position when switching tabs
+
+---
+
+## Q10: Retrofit / NetworkModule — the REST API layer
+
+### What is Retrofit?
+Type-safe HTTP client for Android. You define an interface describing your API; Retrofit generates the implementation.
+
+### `JobApiService` — the API contract
+```kotlin
+interface JobApiService {
+    @GET("habits/")
+    suspend fun getHabits(): Response<List<HabitDto>>
+
+    @POST("habits/")
+    suspend fun createHabit(@Body habit: CreateHabitDto): Response<HabitDto>
+
+    @PUT("habits/{id}")
+    suspend fun updateHabit(@Path("id") id: Int, @Body habit: CreateHabitDto): Response<HabitDto>
+
+    @DELETE("habits/{id}")
+    suspend fun deleteHabit(@Path("id") id: Int): Response<Unit>
+}
+```
+- `@GET`, `@POST`, `@PUT`, `@DELETE` — HTTP methods
+- `@Path("id")` — replaces `{id}` in the URL with the actual value
+- `@Body` — serializes the Kotlin object to JSON as the request body
+- `suspend` — Retrofit supports coroutines natively
+- `Response<T>` — wraps result so you can check `isSuccessful`, `code()`, `body()`
+
+### `NetworkModule` — building Retrofit with Hilt
+
+```kotlin
+private const val BASE_URL = "http://10.0.2.2:8000/"
+```
+`10.0.2.2` is the Android emulator's alias for `localhost` on the host machine. Your backend runs on `localhost:8000` on your PC; the emulator reaches it via `10.0.2.2:8000`.
+
+```kotlin
+OkHttpClient.Builder()
+    .addInterceptor(logging)
+    .addInterceptor(Interceptor { chain ->
+        val request = chain.request().newBuilder()
+            .addHeader("X-Authentication", "yes")
+            .build()
+        chain.proceed(request)
+    })
+    .build()
+```
+**Interceptors** run on every HTTP request. The logging interceptor prints full request/response bodies to Logcat. The custom interceptor adds `X-Authentication: yes` to every request automatically.
+
+`GsonConverterFactory` automatically converts JSON ↔ Kotlin data classes. `retrofit.create(JobApiService::class.java)` generates the implementation at runtime — you never write HTTP code manually.
+
+### `safeApiCall` — the error wrapper
+```kotlin
+private inline fun <T> safeApiCall(block: () -> NetworkResult<T>): NetworkResult<T> =
+    try { block() } catch (e: Exception) { NetworkResult.Error(e.message ?: "Network error") }
+```
+Wraps every network call in try/catch. If the network is down, returns `NetworkResult.Error` instead of crashing. `inline` means no overhead from the lambda object.
+
+### DTOs vs Domain models
+`HabitDto` is the raw API shape. `Job` is your app's domain model. The mapper (`toDomain()`) converts between them — the ViewModel never sees raw API shapes.
+
+---
+
+## Q11: The Architecture Pitch — 60-second answer
+
+> "The app follows **MVVM** — Model, View, ViewModel — with a single Activity and Jetpack Compose for all UI.
+>
+> The **View** layer is pure Compose composables. They observe state from the ViewModel and emit events back — they have no business logic.
+>
+> The **ViewModel** holds UI state as `StateFlow`s, handles validation, and calls the repository. It survives configuration changes so state isn't lost on rotation.
+>
+> The **Model** layer has two data sources: Room for local SQLite storage, and remote sources — Firebase Auth and Firestore for user auth and cloud job storage, plus a Retrofit client for an external habits API. Repositories abstract these sources so the ViewModel doesn't know or care where data comes from.
+>
+> Dependency injection is handled by Hilt — it wires ViewModels, repositories, Firebase, Room, and Retrofit together automatically. All async work uses Kotlin Coroutines and Flow."
+
+---
+
+### Likely defense questions — all three topics
+
+| Question | Key answer |
+|---|---|
+| Why one Activity? | Single Activity + Compose Navigation is the modern Android pattern |
+| What does `@AndroidEntryPoint` do? | Tells Hilt to inject into this Activity — required for `hiltViewModel()` to work |
+| How does the app know if the user is already logged in? | `AuthViewModel` checks `FirebaseAuth.currentUser` synchronously on launch |
+| Why `remember { startDestination }`? | Computed once — not recalculated on every recomposition |
+| What does `popUpTo(0)` on logout do? | Clears the entire back stack so the user can't go Back into the app |
+| What is `launchSingleTop`? | Prevents creating duplicate copies of a screen when navigating to it |
+| What is Retrofit? | Type-safe HTTP client — you define an interface, it generates the implementation |
+| What does `@Body` do? | Serializes a Kotlin object to JSON and sends it as the request body |
+| What does `@Path` do? | Substitutes a value into a URL template, e.g. `{id}` → `123` |
+| What is an interceptor? | Middleware that runs on every HTTP request — used for logging and adding headers |
+| Why `10.0.2.2` instead of `localhost`? | The emulator's alias for the host machine's localhost |
+| What is `GsonConverterFactory`? | Automatically converts JSON responses into Kotlin data classes |
+| What is `safeApiCall`? | Inline helper that wraps network calls in try/catch, returns `NetworkResult.Error` on failure |
+| What is a DTO? | Data Transfer Object — raw API shape; mapped to a domain model before the ViewModel sees it |
+| Explain your architecture in one minute | MVVM: Compose View → ViewModel with StateFlow → Repository → Room/Firebase/Retrofit, wired by Hilt |
+
+---
