@@ -474,3 +474,190 @@ All automatic — zero manual wiring.
 | What is `collectAsStateWithLifecycle`? | Collects a Flow in Compose, stops collecting when screen is backgrounded |
 
 ---
+
+## Q6: Navigation — how NavGraph.kt routes between screens
+
+### What is Jetpack Compose Navigation?
+Instead of switching between Activities, Compose Navigation uses a single `NavHost` with named **routes**. A `NavController` manages the back stack and moves between them.
+
+### `Screen.kt` — route definitions
+```kotlin
+sealed class Screen(val route: String) {
+    data object Login    : Screen("login_screen")
+    data object Register : Screen("register_screen")
+    data object Home     : Screen("home_screen")
+    data object JobDetails : Screen("job_details_screen/{jobId}") {
+        fun createRoute(jobId: Long): String = "job_details_screen/$jobId"
+    }
+}
+```
+A `sealed class` with `data object` entries — each screen is a singleton with a string route. `{jobId}` is a path argument like a URL parameter. `createRoute(123)` produces `"job_details_screen/123"`.
+
+### `NavGraph.kt` — the map of your app
+```kotlin
+NavHost(navController, startDestination = Screen.Login.route) {
+
+    composable(Screen.Login.route) {
+        LoginScreen(
+            onLoginClick = {
+                navController.navigate(Screen.Home.route) {
+                    popUpTo(Screen.Login.route) { inclusive = true }
+                }
+            }
+        )
+    }
+
+    composable(
+        route = Screen.JobDetails.route,
+        arguments = listOf(navArgument("jobId") { type = NavType.LongType })
+    ) {
+        JobDetailScreen(onBack = { navController.popBackStack() })
+    }
+}
+```
+
+- **`popUpTo(...) { inclusive = true }`** — removes the login screen from the back stack after login. Pressing Back on Home exits the app instead of returning to login.
+- **`popBackStack()`** — goes back one screen.
+- **`navArgument`** — extracts `jobId` from the route string as a typed `Long`.
+
+### Why screens don't take a NavController directly
+`LoginScreen` receives `onLoginClick: () -> Unit` instead of a `NavController`. The screen just says "I'm done" — the NavGraph decides where to go. Keeps screens decoupled, reusable, and testable.
+
+---
+
+## Q7: Firebase & Firestore — what you're using and how it's set up
+
+### Services used
+
+| Service | Purpose |
+|---|---|
+| **Firebase Auth** | User login / registration / sign out |
+| **Firestore** | Cloud database — stores job applications per user |
+
+### `FirebaseModule.kt` — wiring Firebase into Hilt
+```kotlin
+@Provides @Singleton
+fun provideFirebaseAuth(): FirebaseAuth = FirebaseAuth.getInstance()
+
+@Provides @Singleton
+fun provideFirebaseFirestore(): FirebaseFirestore = FirebaseFirestore.getInstance()
+```
+`getInstance()` returns Firebase's own singletons. Wrapping in `@Provides @Singleton` means Hilt manages them — any class that needs `FirebaseAuth` just declares it in its constructor.
+
+### Firestore data structure
+```
+Firestore
+└── users/
+    └── {userId}/
+        └── jobs/
+            └── {jobId}  →  { title, company, status, dateApplied, ... }
+```
+Each user has their own `jobs` subcollection. `userJobsCollection(userId)` builds this path.
+
+### `callbackFlow` — bridging Firestore listeners into a Flow
+```kotlin
+override fun getJobsForUser(userId: String): Flow<NetworkResult<List<Job>>> = callbackFlow {
+    trySend(NetworkResult.Loading)
+    val listener = userJobsCollection(userId).addSnapshotListener { snapshot, error ->
+        if (error != null) {
+            trySend(NetworkResult.Error(error.message ?: "Firestore error"))
+            return@addSnapshotListener
+        }
+        val jobs = snapshot?.documents?.mapNotNull { ... } ?: emptyList()
+        trySend(NetworkResult.Success(jobs))
+    }
+    awaitClose { listener.remove() }
+}
+```
+Firestore's `addSnapshotListener` fires every time data changes in the cloud. `callbackFlow` converts it into a Kotlin Flow:
+- `trySend()` emits a value into the Flow
+- Every cloud change fires the listener → emits a new value → UI updates automatically
+- `awaitClose { listener.remove() }` — removes the listener when nobody is collecting, preventing memory leaks
+
+---
+
+## Q8: Jetpack Compose Basics — @Composable, recomposition, state
+
+### What is Jetpack Compose?
+Android's modern UI toolkit. Instead of XML layouts and `findViewById`, you write UI as Kotlin functions. The framework draws UI based on state.
+
+### `@Composable`
+```kotlin
+@Composable
+fun AuthHeader(title: String, subtitle: String) {
+    Column {
+        Text(text = title)
+        Text(text = subtitle)
+    }
+}
+```
+- Can only be called from another `@Composable`
+- Has no return value — it emits UI
+- Should have no side effects (no network calls, no file writes)
+
+### Recomposition
+When state changes, Compose **re-runs only the composables that read that state** — not the whole screen.
+```kotlin
+val emailError by viewModel.emailError.collectAsStateWithLifecycle()
+
+Text(text = emailError ?: "")  // only this recomposes when emailError changes
+```
+If `emailError` didn't change, `Text` won't re-render. No manual view updates needed.
+
+### State in Compose
+Only reads of `State<T>` objects trigger recomposition. `collectAsStateWithLifecycle()` converts a `StateFlow` into Compose `State`:
+```kotlin
+val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+```
+The `by` delegate means you use `uiState` directly (not `uiState.value`). Every emission schedules recomposition of anything that reads it.
+
+### `LaunchedEffect` — side effects
+```kotlin
+LaunchedEffect(uiState) {
+    if (uiState is LoginUiState.Success) onLoginClick()
+}
+```
+Composables shouldn't trigger navigation directly in their body — that would run on every recompose. `LaunchedEffect(key)` runs its block in a coroutine **once when the key changes**. When `uiState` becomes `Success`, navigate — but only once.
+
+### `Modifier`
+```kotlin
+Column(
+    modifier = Modifier
+        .fillMaxSize()
+        .padding(16.dp)
+)
+```
+Chains UI instructions — size, padding, background, click handlers. Order matters — `padding` then `fillMaxSize` ≠ `fillMaxSize` then `padding`.
+
+### `@Preview`
+```kotlin
+@Preview(showBackground = true, showSystemUi = true)
+@Composable
+fun LoginScreenPreview() {
+    LoginScreen(email = "test@example.com", ...)
+}
+```
+Renders the composable in Android Studio without running the app. This is why the private stateless `LoginScreen` overload exists — preview it with hardcoded data, no ViewModel or Firebase needed.
+
+---
+
+### Likely defense questions — all three topics
+
+| Question | Key answer |
+|---|---|
+| What is a route in navigation? | A string identifier for a screen, like a URL |
+| What does `popUpTo` do? | Removes screens from the back stack up to the specified route |
+| Why pass callbacks instead of NavController to screens? | Decouples screens from navigation — reusable and testable |
+| How do you pass data between screens? | Path arguments in the route string, declared with `navArgument` |
+| What is Firebase Auth? | Manages user accounts — sign in, register, sign out |
+| What is Firestore? | Cloud NoSQL document database — stores data as collections of documents |
+| What is `callbackFlow`? | Converts a callback-based API into a Kotlin Flow |
+| What does `awaitClose` do? | Cleans up the listener when the Flow has no more collectors — prevents leaks |
+| What is `@Composable`? | Annotation marking a function that emits UI |
+| What is recomposition? | Compose re-runs composables that read changed state |
+| What triggers recomposition? | Reading a `State<T>` object whose value changed |
+| What is `LaunchedEffect`? | Runs a coroutine as a side effect when its key changes — not on every recompose |
+| What does `collectAsStateWithLifecycle` do? | Converts a StateFlow into Compose State; stops collecting when screen is backgrounded |
+| What is a `Modifier`? | Chains UI instructions (size, padding, clicks); order matters |
+
+---
